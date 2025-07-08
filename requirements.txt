@@ -1,0 +1,4 @@
+google-adk==1.2.1
+fastapi
+uvicorn
+python-dotenv
