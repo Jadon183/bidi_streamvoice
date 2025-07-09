@@ -15,7 +15,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from google_search_agent.agent import root_agent
+from agent import root_agent
 
 warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
 
