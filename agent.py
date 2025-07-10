@@ -12,21 +12,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from google.adk.agents import Agent
-from google.adk.tools import google_search  # Import the tool
+# from google.adk.agents import Agent
+# from google.adk.tools import google_search  # Import the tool
 
-#todo instruction
+# #todo instruction
+
+# root_agent = Agent(
+#    # A unique name for the agent.
+#    name="google_search_agent",
+#    # The Large Language Model (LLM) that agent will use.
+#    model="gemini-2.0-flash-exp", # if this model does not work, try below
+#    #model="gemini-2.0-flash-live-001",
+#    # A short description of the agent's purpose.
+#    description="Agent to answer questions using Google Search.",
+#    # Instructions to set the agent's behavior.
+#    instruction="Answer the question using the Google Search tool.",
+#    # Add google_search tool to perform grounding with Google search.
+#    tools=[google_search],
+# )
+
+from google.adk.agents import Agent
+from google.adk.tools import google_search
 
 root_agent = Agent(
-   # A unique name for the agent.
    name="google_search_agent",
-   # The Large Language Model (LLM) that agent will use.
-   model="gemini-2.0-flash-exp", # if this model does not work, try below
-   #model="gemini-2.0-flash-live-001",
-   # A short description of the agent's purpose.
-   description="Agent to answer questions using Google Search.",
-   # Instructions to set the agent's behavior.
-   instruction="Answer the question using the Google Search tool.",
-   # Add google_search tool to perform grounding with Google search.
+   model="gemini-2.0-flash-exp",
+   description="A helpful AI that can answer questions and remember recent conversation.",
+   instruction=(
+       "Answer the question using the Google Search tool if needed. "
+       "Try to remember what the user previously asked within the session."
+   ),
    tools=[google_search],
+   memory=True  # Enables short-term memory for multi-turn reasoning
 )
