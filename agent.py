@@ -43,5 +43,4 @@ root_agent = Agent(
        "Try to remember what the user previously asked within the session."
    ),
    tools=[google_search],
-   memory=True  # Enables short-term memory for multi-turn reasoning
 )
