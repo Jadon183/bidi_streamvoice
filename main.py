@@ -1,244 +1,258 @@
 import os
 import json
-import base64
 import asyncio
+import base64
+import uuid
 import warnings
 
+from pathlib import Path
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import StreamingResponse, PlainTextResponse
-from fastapi.middleware.cors import CORSMiddleware
-from twilio.twiml.voice_response import VoiceResponse, Connect, Stream
 
-from google.genai.types import Part, Content, Blob
+from google.genai.types import (
+    Part,
+    Content,
+    Blob,
+)
+
 from google.adk.runners import InMemoryRunner
 from google.adk.agents import LiveRequestQueue
 from google.adk.agents.run_config import RunConfig
 
+from fastapi import FastAPI, WebSocket
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+
 from agent import root_agent
 
+
+
+#
+# ADK Streaming
+#
+
+# Load Gemini API Key
+
+from fastapi import WebSocket
+#from twilio_adapter import twilio_audio_stream_handler, adk_response_to_twilio
+import asyncio
+import base64
+import json
+
+from google.genai.types import Content, Part, Blob
+from google.adk.agents import LiveRequestQueue
+from starlette.websockets import WebSocket
+
 warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
-load_dotenv()
-#STREAM_URL = os.getenv("TWILIO_STREAM_URL")
-STREAM_URL = "bidi-streamvoice-836864412652.us-central1.run.app"
+AUDIO_MIME = "audio/pcm"
+
+async def twilio_audio_stream_handler(websocket: WebSocket, live_request_queue: LiveRequestQueue):
+    while True:
+        try:
+            # Raw PCM from Twilio
+            frame = await websocket.receive_bytes()
+            # Directly send to ADK agent as Blob
+            live_request_queue.send_realtime(Blob(data=frame, mime_type=AUDIO_MIME))
+        except Exception as e:
+            print("[Twilio Stream Error]", e)
+            break
+
+async def adk_response_to_twilio(websocket: WebSocket, live_events):
+    async for event in live_events:
+        part: Part = (
+            event.content and event.content.parts and event.content.parts[0]
+        )
+        if part and part.inline_data and part.inline_data.mime_type.startswith("audio/pcm"):
+            audio_data = part.inline_data.data
+            await websocket.send_bytes(audio_data)
+            print(f"[ADK → Twilio] Sent {len(audio_data)} bytes")
 
 APP_NAME = "ADK Streaming example"
-app = FastAPI()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
-active_sessions = {}
+async def start_agent_session(user_id, is_audio=False):
+    """Starts an agent session"""
 
-# ---------- Gemini Agent Setup ----------
+    # Create a Runner
+    runner = InMemoryRunner(
+        app_name=APP_NAME,
+        agent=root_agent,
+    )
 
-async def start_agent_session(user_id: str, is_audio: bool = True):
-    runner = InMemoryRunner(app_name=APP_NAME, agent=root_agent)
-    session = await runner.session_service.create_session(app_name=APP_NAME, user_id=user_id)
+    # Create a Session
+    session = await runner.session_service.create_session(
+        app_name=APP_NAME,
+        user_id=user_id,  # Replace with actual user ID
+    )
+
+    # Set response modality
     modality = "AUDIO" if is_audio else "TEXT"
     run_config = RunConfig(response_modalities=[modality])
+
+    # Create a LiveRequestQueue for this session
     live_request_queue = LiveRequestQueue()
-    live_events = runner.run_live(session=session, live_request_queue=live_request_queue, run_config=run_config)
+
+    # Start agent session
+    live_events = runner.run_live(
+        session=session,
+        live_request_queue=live_request_queue,
+        run_config=run_config,
+    )
     return live_events, live_request_queue
 
 
-# ---------- Twilio Call Entry Point ----------
+async def agent_to_client_messaging(websocket, live_events):
+    """Agent to client communication"""
+    while True:
+        async for event in live_events:
 
-@app.post("/twilio/voice", response_class=PlainTextResponse)
-async def handle_outbound_call():
-    response = VoiceResponse()
-    connect = Connect()
-    connect.stream(
-        url=f"wss://{STREAM_URL}/twilio/media",  # Correctly interpolated
-        track="both_tracks"
+            # If the turn complete or interrupted, send it
+            if event.turn_complete or event.interrupted:
+                message = {
+                    "turn_complete": event.turn_complete,
+                    "interrupted": event.interrupted,
+                }
+                await websocket.send_text(json.dumps(message))
+                print(f"[AGENT TO CLIENT]: {message}")
+                continue
+
+            # Read the Content and its first Part
+            part: Part = (
+                event.content and event.content.parts and event.content.parts[0]
+            )
+            if not part:
+                continue
+
+            # If it's audio, send Base64 encoded audio data
+            is_audio = part.inline_data and part.inline_data.mime_type.startswith("audio/pcm")
+            if is_audio:
+                audio_data = part.inline_data and part.inline_data.data
+                if audio_data:
+                    message = {
+                        "mime_type": "audio/pcm",
+                        "data": base64.b64encode(audio_data).decode("ascii")
+                    }
+                    await websocket.send_text(json.dumps(message))
+                    print(f"[AGENT TO CLIENT]: audio/pcm: {len(audio_data)} bytes.")
+                    continue
+
+            # If it's text and a parial text, send it
+            if part.text and event.partial:
+                message = {
+                    "mime_type": "text/plain",
+                    "data": part.text
+                }
+                await websocket.send_text(json.dumps(message))
+                print(f"[AGENT TO CLIENT]: text/plain: {message}")
+
+
+async def client_to_agent_messaging(websocket, live_request_queue):
+    """Client to agent communication"""
+    while True:
+        # Decode JSON message
+        message_json = await websocket.receive_text()
+        message = json.loads(message_json)
+        mime_type = message["mime_type"]
+        data = message["data"]
+
+        # Send the message to the agent
+        if mime_type == "text/plain":
+            # Send a text message
+            content = Content(role="user", parts=[Part.from_text(text=data)])
+            live_request_queue.send_content(content=content)
+            print(f"[CLIENT TO AGENT]: {data}")
+        elif mime_type == "audio/pcm":
+            # Send an audio data
+            decoded_data = base64.b64decode(data)
+            live_request_queue.send_realtime(Blob(data=decoded_data, mime_type=mime_type))
+        else:
+            raise ValueError(f"Mime type not supported: {mime_type}")
+
+
+#
+# FastAPI web app
+#
+
+app = FastAPI()
+
+
+
+@app.websocket("/twilio/{user_id}")
+async def twilio_ws_endpoint(websocket: WebSocket, user_id: str):
+    """Direct WebSocket endpoint for Twilio PCM audio"""
+    await websocket.accept()
+    print(f"[Twilio] Connected for user {user_id}")
+
+    # Start ADK session
+    user_id_str = str(user_id)
+    live_events, live_request_queue = await start_agent_session(user_id_str, is_audio=True)
+
+    # Two-way streaming: Twilio → ADK and ADK → Twilio
+    twilio_to_adk_task = asyncio.create_task(
+        twilio_audio_stream_handler(websocket, live_request_queue)
     )
-    response.append(connect)
-    return str(response)
+    adk_to_twilio_task = asyncio.create_task(
+        adk_response_to_twilio(websocket, live_events)
+    )
 
-# ---------- Twilio Media WebSocket ----------
+    await asyncio.wait(
+        [twilio_to_adk_task, adk_to_twilio_task],
+        return_when=asyncio.FIRST_EXCEPTION
+    )
 
-@app.websocket("/twilio/media")
-async def twilio_media_stream(websocket: WebSocket):
-    await websocket.accept()
-    user_id = f"user_{id(websocket)}"
-    print(f"🔌 Connected: {user_id}")
+    live_request_queue.close()
+    print(f"[Twilio] Disconnected user {user_id}")
 
-    live_events, live_request_queue = await start_agent_session(user_id, is_audio=True)
-    active_sessions[user_id] = live_request_queue
-
-    # Task to send audio from Gemini → Twilio
-    async def send_agent_audio():
-        try:
-            async for event in live_events:
-                part = event.content.parts[0] if event.content and event.content.parts else None
-                if part and part.inline_data and part.inline_data.mime_type == "audio/pcm":
-                    audio_bytes = part.inline_data.data
-                    base64_audio = base64.b64encode(audio_bytes).decode("ascii")
-
-                    twilio_msg = {
-                        "event": "media",
-                        "media": {"payload": base64_audio}
-                    }
-                    await websocket.send_json(twilio_msg)
-        except Exception as e:
-            print(f"⚠️ Agent audio send error: {e}")
-
-    send_task = asyncio.create_task(send_agent_audio())
-
-    try:
-        while True:
-            data = await websocket.receive_json()
-            event_type = data.get("event")
-
-            if event_type == "start":
-                print("📞 Call started")
-
-            elif event_type == "media":
-                payload = data["media"]["payload"]
-                audio_bytes = base64.b64decode(payload)
-                blob = Blob(data=audio_bytes, mime_type="audio/pcm")
-                live_request_queue.send_realtime(blob)
-
-            elif event_type == "stop":
-                print("📴 Call ended")
-                break
-
-    except WebSocketDisconnect:
-        print(f"❌ Disconnected: {user_id}")
-    except Exception as e:
-        print(f"❗ Error: {e}")
-    finally:
-        send_task.cancel()
-        live_request_queue.close()
-        active_sessions.pop(user_id, None)
-"""
-
-# ---------- Twilio Media WebSocket ----------
-
-@app.websocket("/twilio/media")
-async def twilio_media_stream(websocket: WebSocket):
-    await websocket.accept()
-    user_id = f"user_{id(websocket)}"
-    print(f"🔌 Connected: {user_id}")
-
-    live_events, live_request_queue = await start_agent_session(user_id, is_audio=True)
-    active_sessions[user_id] = live_request_queue
-
-    # Task to send audio from Gemini -> Twilio
-    async def send_agent_audio():
-        try:
-            async for event in live_events:
-                part = event.content.parts[0] if event.content and event.content.parts else None
-                if part and part.inline_data and part.inline_data.mime_type == "audio/pcm":
-                    audio_bytes = part.inline_data.data
-                    base64_audio = base64.b64encode(audio_bytes).decode("ascii")
-
-                    twilio_msg = {
-                        "event": "media",
-                        "media": {"payload": base64_audio}
-                    }
-                    await websocket.send_json(twilio_msg)
-        except Exception as e:
-            print(f"⚠️ Agent audio send error: {e}")
-
-    send_task = asyncio.create_task(send_agent_audio())
-
-    try:
-        while True:
-            data = await websocket.receive_json()
-            event_type = data.get("event")
-
-            if event_type == "start":
-                print(f"📞 Call started")
-
-            elif event_type == "media":
-                payload = data["media"]["payload"]
-                audio_bytes = base64.b64decode(payload)
-                blob = Blob(data=audio_bytes, mime_type="audio/pcm")
-                live_request_queue.send_realtime(blob)
-
-            elif event_type == "stop":
-                print(f"📴 Call ended")
-                break
-
-    except WebSocketDisconnect:
-        print(f"❌ Disconnected: {user_id}")
-    except Exception as e:
-        print(f"❗ Error: {e}")
-    finally:
-        send_task.cancel()
-        live_request_queue.close()
-        active_sessions.pop(user_id, None)
-"""
-# ---------- Optional Browser SSE ----------
-
-async def agent_to_client_sse(live_events):
-    async for event in live_events:
-        if event.turn_complete or event.interrupted:
-            yield f"data: {json.dumps({'done': True})}\n\n"
-            continue
-
-        part = event.content and event.content.parts and event.content.parts[0]
-        if not part:
-            continue
-
-        if part.inline_data and part.inline_data.mime_type.startswith("audio/pcm"):
-            message = {
-                "mime_type": "audio/pcm",
-                "data": base64.b64encode(part.inline_data.data).decode("ascii")
-            }
-            yield f"data: {json.dumps(message)}\n\n"
-        elif part.text and event.partial:
-            yield f"data: {json.dumps({'mime_type': 'text/plain', 'data': part.text})}\n\n"
 
 @app.get("/")
-def root():
-    return {"message": "FastAPI ADK Server Running"}
+async def root():
+    """Serves the index.html"""
+    return "Sab changa hai"
 
-@app.get("/events/{user_id}")
-async def sse_endpoint(user_id: int, is_audio: str = "false"):
+from fastapi.responses import Response
+
+CLOUD_RUN_URL = "https://bidi-streamvoice-836864412652.us-central1.run.app"
+
+@app.post("/voice")
+async def voice_webhook():
+    session_id = str(uuid.uuid4())  # Optional: generate random ID for each call
+    stream_url = f"{CLOUD_RUN_URL}/twilio/{session_id}"
+
+    print(f"[Twilio Webhook] Starting stream to {stream_url}")
+    return Response(content=f"""
+        <Response>
+            <Start>
+                <Stream url="{stream_url}"/>
+            </Start>
+            <Say>Welcome to Quantum Veda AI Assistant. How can I help you today?</Say>
+        </Response>
+    """, media_type="application/xml")
+
+@app.websocket("/ws/{user_id}")
+async def websocket_endpoint(websocket: WebSocket, user_id: int, is_audio: str):
+    """Client websocket endpoint"""
+
+    # Wait for client connection
+    await websocket.accept()
+    print(f"Client #{user_id} connected, audio mode: {is_audio}")
+
+    # Start agent session
     user_id_str = str(user_id)
     live_events, live_request_queue = await start_agent_session(user_id_str, is_audio == "true")
-    active_sessions[user_id_str] = live_request_queue
 
-    def cleanup():
-        live_request_queue.close()
-        active_sessions.pop(user_id_str, None)
+    # Start tasks
+    agent_to_client_task = asyncio.create_task(
+        agent_to_client_messaging(websocket, live_events)
+    )
+    client_to_agent_task = asyncio.create_task(
+        client_to_agent_messaging(websocket, live_request_queue)
+    )
 
-    async def event_generator():
-        try:
-            async for data in agent_to_client_sse(live_events):
-                yield data
-        except Exception as e:
-            print(f"[SSE Error]: {e}")
-        finally:
-            cleanup()
+    # Wait until the websocket is disconnected or an error occurs
+    tasks = [agent_to_client_task, client_to_agent_task]
+    await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    # Close LiveRequestQueue
+    live_request_queue.close()
 
-@app.post("/send/{user_id}")
-async def send_message_endpoint(user_id: int, request: Request):
-    user_id_str = str(user_id)
-    live_request_queue = active_sessions.get(user_id_str)
-    if not live_request_queue:
-        return {"error": "Session not found"}
-
-    message = await request.json()
-    mime_type = message["mime_type"]
-    data = message["data"]
-
-    if mime_type == "text/plain":
-        content = Content(role="user", parts=[Part.from_text(text=data)])
-        live_request_queue.send_content(content=content)
-    elif mime_type == "audio/pcm":
-        decoded_data = base64.b64decode(data)
-        live_request_queue.send_realtime(Blob(data=decoded_data, mime_type=mime_type))
-    else:
-        return {"error": f"Unsupported mime type: {mime_type}"}
-
-    return {"status": "sent"}
+    # Disconnected
+    print(f"Client #{user_id} disconnected")
