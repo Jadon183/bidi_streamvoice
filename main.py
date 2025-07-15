@@ -45,26 +45,30 @@ from starlette.websockets import WebSocket
 warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
 AUDIO_MIME = "audio/pcm"
 
-async def twilio_audio_stream_handler(websocket: WebSocket, live_request_queue: LiveRequestQueue):
+async def twilio_audio_stream_handler(websocket, request_queue):
     while True:
         try:
-            # Raw PCM from Twilio
-            frame = await websocket.receive_bytes()
-            # Directly send to ADK agent as Blob
-            live_request_queue.send_realtime(Blob(data=frame, mime_type=AUDIO_MIME))
+            msg = await websocket.receive_text()
+            data = json.loads(msg)
+            if data["event"] == "media":
+                payload = base64.b64decode(data["media"]["payload"])
+                request_queue.send_realtime(Blob(data=payload, mime_type="audio/pcm"))
         except Exception as e:
-            print("[Twilio Stream Error]", e)
+            print("[Twilio→ADK Error]:", str(e))
             break
 
-async def adk_response_to_twilio(websocket: WebSocket, live_events):
+async def adk_response_to_twilio(websocket, live_events):
     async for event in live_events:
-        part: Part = (
-            event.content and event.content.parts and event.content.parts[0]
-        )
+        part = event.content and event.content.parts and event.content.parts[0]
         if part and part.inline_data and part.inline_data.mime_type.startswith("audio/pcm"):
-            audio_data = part.inline_data.data
-            await websocket.send_bytes(audio_data)
-            print(f"[ADK → Twilio] Sent {len(audio_data)} bytes")
+            audio_bytes = part.inline_data.data
+            payload = base64.b64encode(audio_bytes).decode("ascii")
+            json_msg = {
+                "event": "media",
+                "streamSid": "ADK-GENERATED",  # Optional
+                "media": {"payload": payload}
+            }
+            await websocket.send_text(json.dumps(json_msg))
 
 APP_NAME = "ADK Streaming example"
 
@@ -174,33 +178,16 @@ async def client_to_agent_messaging(websocket, live_request_queue):
 
 app = FastAPI()
 
-
-
 @app.websocket("/twilio/{user_id}")
 async def twilio_ws_endpoint(websocket: WebSocket, user_id: str):
-    """Direct WebSocket endpoint for Twilio PCM audio"""
     await websocket.accept()
-    print(f"[Twilio] Connected for user {user_id}")
-
-    # Start ADK session
-    user_id_str = str(user_id)
-    live_events, live_request_queue = await start_agent_session(user_id_str, is_audio=True)
-
-    # Two-way streaming: Twilio → ADK and ADK → Twilio
-    twilio_to_adk_task = asyncio.create_task(
-        twilio_audio_stream_handler(websocket, live_request_queue)
-    )
-    adk_to_twilio_task = asyncio.create_task(
-        adk_response_to_twilio(websocket, live_events)
-    )
-
-    await asyncio.wait(
-        [twilio_to_adk_task, adk_to_twilio_task],
-        return_when=asyncio.FIRST_EXCEPTION
-    )
-
-    live_request_queue.close()
-    print(f"[Twilio] Disconnected user {user_id}")
+    print(f"[WebSocket] Twilio connected: {user_id}")
+    events, queue = await start_agent_session(user_id, is_audio=True)
+    task_recv = asyncio.create_task(twilio_audio_stream_handler(websocket, queue))
+    task_send = asyncio.create_task(adk_response_to_twilio(websocket, events))
+    await asyncio.wait([task_recv, task_send], return_when=asyncio.FIRST_EXCEPTION)
+    queue.close()
+    print(f"[WebSocket] Disconnected: {user_id}")
 
 
 @app.get("/")
@@ -214,18 +201,19 @@ CLOUD_RUN_URL = "https://bidi-streamvoice-836864412652.us-central1.run.app"
 
 @app.post("/voice")
 async def voice_webhook():
-    session_id = str(uuid.uuid4())  # Optional: generate random ID for each call
+    session_id = str(uuid.uuid4())
     stream_url = f"{CLOUD_RUN_URL}/twilio/{session_id}"
 
-    print(f"[Twilio Webhook] Starting stream to {stream_url}")
-    return Response(content=f"""
-        <Response>
-            <Start>
-                <Stream url="{stream_url}"/>
-            </Start>
-            <Say>Welcome to Quantum Veda AI Assistant. How can I help you today?</Say>
-        </Response>
-    """, media_type="application/xml")
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Connect>
+    <Stream url="{stream_url}" />
+  </Connect>
+  <Say>Welcome to Quantum Veda AI Assistant.</Say>
+</Response>"""
+    
+    print("[TwiML] →", xml)
+    return Response(content=xml, media_type="application/xml")
 
 @app.websocket("/ws/{user_id}")
 async def websocket_endpoint(websocket: WebSocket, user_id: int, is_audio: str):
