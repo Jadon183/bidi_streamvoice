@@ -24,6 +24,12 @@ async def start_agent_session(user_id: str, is_audio=True):
     live_events = runner.run_live(session=session, live_request_queue=queue, run_config=config)
     return live_events, queue
 
+@app.websocket("/twilio/test123")
+async def test_ws(websocket: WebSocket):
+    await websocket.accept()
+    print("✅ Twilio WebSocket connected!")
+    await websocket.close()
+
 # --- Twilio-Compatible TwiML Webhook --- #
 @app.post("/voice")
 async def voice_webhook():
@@ -32,10 +38,11 @@ async def voice_webhook():
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <Stream url="{stream_url}" />
+    <Stream url="wss://bidi-streamvoice-836864412652.us-central1.run.app/twilio/test123"/>
   </Connect>
   <Say>Welcome to Quantum Veda AI Assistant.</Say>
 </Response>"""
+    print("[TwiML Response]:", xml)
     return Response(content=xml.strip(), media_type="application/xml")
 
 # --- Twilio Media Stream WebSocket Handler --- #
