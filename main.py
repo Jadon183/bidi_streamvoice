@@ -19,7 +19,8 @@ from agent import root_agent
 
 warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
 load_dotenv()
-STREAM_URL = os.getenv("TWILIO_STREAM_URL")
+#STREAM_URL = os.getenv("TWILIO_STREAM_URL")
+STREAM_URL = "bidi-streamvoice-836864412652.us-central1.run.app"
 
 APP_NAME = "ADK Streaming example"
 app = FastAPI()
@@ -45,19 +46,77 @@ async def start_agent_session(user_id: str, is_audio: bool = True):
     live_events = runner.run_live(session=session, live_request_queue=live_request_queue, run_config=run_config)
     return live_events, live_request_queue
 
-# ---------- Twilio Call Entry ----------
+
+# ---------- Twilio Call Entry Point ----------
 
 @app.post("/twilio/voice", response_class=PlainTextResponse)
 async def handle_outbound_call():
     response = VoiceResponse()
     connect = Connect()
     connect.stream(
-        url="wss://{STREAM_URL}/twilio/media",  # Replace with your deployed WebSocket
-        track="both_tracks",
-        content_type="audio/l16;rate=16000"
+        url=f"wss://{STREAM_URL}/twilio/media",  # Correctly interpolated
+        track="both_tracks"
     )
     response.append(connect)
     return str(response)
+
+# ---------- Twilio Media WebSocket ----------
+
+@app.websocket("/twilio/media")
+async def twilio_media_stream(websocket: WebSocket):
+    await websocket.accept()
+    user_id = f"user_{id(websocket)}"
+    print(f"🔌 Connected: {user_id}")
+
+    live_events, live_request_queue = await start_agent_session(user_id, is_audio=True)
+    active_sessions[user_id] = live_request_queue
+
+    # Task to send audio from Gemini → Twilio
+    async def send_agent_audio():
+        try:
+            async for event in live_events:
+                part = event.content.parts[0] if event.content and event.content.parts else None
+                if part and part.inline_data and part.inline_data.mime_type == "audio/pcm":
+                    audio_bytes = part.inline_data.data
+                    base64_audio = base64.b64encode(audio_bytes).decode("ascii")
+
+                    twilio_msg = {
+                        "event": "media",
+                        "media": {"payload": base64_audio}
+                    }
+                    await websocket.send_json(twilio_msg)
+        except Exception as e:
+            print(f"⚠️ Agent audio send error: {e}")
+
+    send_task = asyncio.create_task(send_agent_audio())
+
+    try:
+        while True:
+            data = await websocket.receive_json()
+            event_type = data.get("event")
+
+            if event_type == "start":
+                print("📞 Call started")
+
+            elif event_type == "media":
+                payload = data["media"]["payload"]
+                audio_bytes = base64.b64decode(payload)
+                blob = Blob(data=audio_bytes, mime_type="audio/pcm")
+                live_request_queue.send_realtime(blob)
+
+            elif event_type == "stop":
+                print("📴 Call ended")
+                break
+
+    except WebSocketDisconnect:
+        print(f"❌ Disconnected: {user_id}")
+    except Exception as e:
+        print(f"❗ Error: {e}")
+    finally:
+        send_task.cancel()
+        live_request_queue.close()
+        active_sessions.pop(user_id, None)
+"""
 
 # ---------- Twilio Media WebSocket ----------
 
@@ -115,7 +174,7 @@ async def twilio_media_stream(websocket: WebSocket):
         send_task.cancel()
         live_request_queue.close()
         active_sessions.pop(user_id, None)
-
+"""
 # ---------- Optional Browser SSE ----------
 
 async def agent_to_client_sse(live_events):
