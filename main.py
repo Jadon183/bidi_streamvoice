@@ -27,8 +27,31 @@ async def start_agent_session(user_id: str, is_audio=True):
 @app.websocket("/twilio/test123")
 async def test_ws(websocket: WebSocket):
     await websocket.accept()
-    print("✅ Twilio WebSocket connected!")
-    await websocket.close()
+    print("✅ Twilio connected to /twilio/test123")
+
+    try:
+        while True:
+            msg = await websocket.receive_text()
+            data = json.loads(msg)
+            print("📩 Twilio event:", data["event"])
+
+            # Reply once we get 'start' event
+            if data["event"] == "start":
+                # Simulate 20ms of silent PCM audio
+                fake_pcm = b"\x00" * 320  # 160 samples for 20ms at 8kHz mono, 16-bit = 320 bytes
+                payload = base64.b64encode(fake_pcm).decode("ascii")
+                reply = {
+                    "event": "media",
+                    "streamSid": data["streamSid"],
+                    "media": {"payload": payload}
+                }
+                await websocket.send_text(json.dumps(reply))
+                print("📤 Sent fake PCM to Twilio")
+
+    except Exception as e:
+        print("❌ WebSocket closed:", str(e))
+
+    print("❌ Twilio disconnected")
 
 # --- Twilio-Compatible TwiML Webhook --- #
 @app.post("/voice")
